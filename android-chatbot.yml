@@ -17,6 +17,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -33,6 +34,54 @@ jobs:
       - name: Install Android build packages
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "cmake;3.31.6" "ndk;27.2.12479018"
 
+      # Non-blocking: checks that the C++ bridge only uses llama.cpp functions that
+      # exist at the commit pinned in CMakeLists.txt, and reports any mismatch in the
+      # run summary. A mismatch here is the most likely cause of a native build failure.
+      - name: Check native bridge against pinned llama.cpp
+        continue-on-error: true
+        shell: bash
+        run: |
+          cmake_file=android_chatbot/app/src/main/cpp/CMakeLists.txt
+          sha=$(grep -oE 'GIT_TAG[[:space:]]+[0-9a-f]{40}' "$cmake_file" | awk '{print $2}')
+          echo "Pinned llama.cpp commit: $sha"
+          mkdir -p "$RUNNER_TEMP/llama" && cd "$RUNNER_TEMP/llama"
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp.git
+          if ! git fetch -q --depth 1 origin "$sha"; then
+            msg="Could not fetch pinned llama.cpp commit $sha. Check GIT_TAG in CMakeLists.txt."
+            echo "::error::$msg"
+            echo "### Native preflight" >> "$GITHUB_STEP_SUMMARY"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git checkout -q FETCH_HEAD
+          missing=""
+          for sym in \
+            llama_batch_ext_init llama_batch_ext_clear llama_batch_ext_add_token \
+            llama_batch_ext_set_pos llama_batch_ext_set_output_logits llama_batch_ext_free \
+            llama_process llama_memory_clear llama_model_chat_template llama_chat_apply_template \
+            mtmd_helper_bitmap_init_from_file mtmd_helper_init_opt_default mtmd_helper_video_free \
+            mtmd_helper_eval_chunks mtmd_context_params_default mtmd_init_from_file; do
+            grep -rqw "$sym" include tools/mtmd 2>/dev/null || missing="$missing $sym"
+          done
+          for opt in LLAMA_BUILD_MTMD MTMD_VIDEO LLAMA_BUILD_APP; do
+            grep -rqw "$opt" CMakeLists.txt tools cmake 2>/dev/null || missing="$missing (cmake option $opt)"
+          done
+          {
+            echo "### Native preflight"
+            echo "Pinned llama.cpp: \`$sha\`"
+            if [ -n "$missing" ]; then
+              echo "Not found at that commit:$missing"
+              echo "native_bridge.cpp / CMakeLists.txt are probably out of sync with this llama.cpp revision."
+            else
+              echo "All llama.cpp / mtmd symbols used by native_bridge.cpp were found."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$missing" ]; then
+            echo "::warning::Not found at pinned llama.cpp commit:$missing"
+            exit 1
+          fi
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
@@ -42,7 +91,27 @@ jobs:
 
       - name: Build debug APK
         working-directory: android_chatbot
-        run: ./gradlew --no-daemon :app:assembleDebug
+        shell: bash
+        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Show build errors in run summary
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Build errors"
+            echo '```'
+            grep -E "^e: |error:|fatal error|undefined reference|CMake Error|What went wrong|Execution failed|FAILED" "$RUNNER_TEMP/build.log" | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -50,3 +119,4 @@ jobs:
           name: local-chat-debug-apk
           path: android_chatbot/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          
